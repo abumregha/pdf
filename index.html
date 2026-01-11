@@ -10,6 +10,13 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/sortablejs/1.15.0/Sortable.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+    <script>
+        // Configure PDF.js worker
+        if (typeof pdfjsLib !== 'undefined') {
+            pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+        }
+    </script>
 
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700&display=swap');
@@ -46,11 +53,16 @@
                 <h1 class="text-2xl font-bold text-blue-600">PDF-Merge <span class="text-slate-400 font-light">| Private Edition</span></h1>
                 <p class="text-xs text-slate-500">تتم المعالجة بالكامل داخل متصفحك. لا ترفع أي ملفات للخادم.</p>
             </div>
-            <div class="flex gap-3">
-                <button onclick="saveFinalPDF()" id="saveBtn" class="hidden bg-blue-600 text-white px-8 py-3 rounded-xl font-bold hover:bg-blue-700 transition shadow-lg flex items-center gap-2">
-                    <span>💾 حفظ وتحميل النتيجة</span>
-                </button>
-                <button onclick="location.reload()" class="bg-slate-100 text-slate-600 px-4 py-3 rounded-xl hover:bg-red-50 hover:text-red-600 transition">خروج</button>
+            <div class="flex gap-3 items-center">
+                <div class="flex items-center gap-3">
+                  <label class="flex items-center gap-2 text-sm text-slate-600 bg-slate-100 px-3 py-2 rounded-xl">
+                    <input type="checkbox" id="highQuality" checked class="h-4 w-4">
+                    جودة عالية
+                  </label>
+                  <button onclick="saveFinalPDF()" id="saveBtn" class="hidden bg-blue-600 text-white px-6 py-3 rounded-xl font-bold hover:bg-blue-700 transition shadow-lg flex items-center gap-2">
+                    <span>💾 حفظ وتحميل</span>
+                  </button>
+                </div>                <button onclick="loadSampleDemo()" id="demoBtn" class="bg-green-600 text-white px-4 py-3 rounded-xl hover:bg-green-700 transition">عرض توضيحي</button>                <button onclick="location.reload()" class="bg-slate-100 text-slate-600 px-4 py-3 rounded-xl hover:bg-red-50 hover:text-red-600 transition">خروج</button>
             </div>
         </header>
 
@@ -84,6 +96,25 @@
             
             <div id="pagesGrid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-6 min-h-[200px] p-2">
                 </div>
+
+            <!-- Full page preview modal -->
+            <div id="previewModal" class="fixed inset-0 bg-black/70 hidden items-center justify-center z-50 p-4">
+              <div class="bg-white rounded-xl shadow-xl max-w-4xl w-full mx-auto p-4 relative">
+                <button id="closePreview" class="absolute top-3 left-3 bg-slate-100 rounded-full p-2">✖️</button>
+                <div class="flex items-center justify-between mb-3">
+                  <div class="text-sm text-slate-600" id="previewLabel">صفحة 1</div>
+                  <div class="flex gap-2">
+                    <button id="prevPage" class="bg-slate-100 p-2 rounded-md">⬅️</button>
+                    <button id="nextPage" class="bg-slate-100 p-2 rounded-md">➡️</button>
+                    <button id="rotatePreview" class="bg-blue-600 text-white px-3 py-2 rounded-md">🔄 تدوير</button>
+                    <button id="deletePreview" class="bg-red-50 text-red-600 px-3 py-2 rounded-md">🗑️ حذف</button>
+                  </div>
+                </div>
+                <div class="w-full h-[70vh] flex items-center justify-center">
+                  <canvas id="previewCanvas" class="max-w-full max-h-full bg-slate-50 rounded-lg"></canvas>
+                </div>
+              </div>
+            </div>
         </div>
     </div>
 
@@ -111,13 +142,21 @@
                 if (type === 'pdf') {
                     const bytes = await file.arrayBuffer();
                     const pdf = await PDFDocument.load(bytes);
+                    // Try to load PDF via PDF.js for rendering thumbnails
+                    let pdfJsDoc = null;
+                    if (typeof pdfjsLib !== 'undefined') {
+                        try { pdfJsDoc = await pdfjsLib.getDocument({ data: bytes }).promise; } catch (e) { console.warn('PDF.js thumbnail failed', e); }
+                    }
                     const count = pdf.getPageCount();
                     for (let i = 0; i < count; i++) {
-                        loadedPages.push({ type: 'pdf', srcDoc: pdf, pageIndex: i, rotation: 0, id: Math.random().toString(36).substr(2, 9) });
+                        const thumb = pdfJsDoc ? await renderPdfPageToThumbnail(pdfJsDoc, i + 1) : null;
+                        loadedPages.push({ type: 'pdf', srcDoc: pdf, pdfJs: pdfJsDoc, pageIndex: i, rotation: 0, id: Math.random().toString(36).substr(2, 9), thumbnail: thumb });
                     }
                 } else {
                     const bytes = await file.arrayBuffer();
-                    loadedPages.push({ type: 'img', bytes: bytes, imgType: file.type, rotation: 0, id: Math.random().toString(36).substr(2, 9) });
+                    const blob = new Blob([bytes], { type: file.type });
+                    const thumb = await renderImageToThumbnail(blob);
+                    loadedPages.push({ type: 'img', bytes: bytes, imgType: file.type, rotation: 0, id: Math.random().toString(36).substr(2, 9), thumbnail: thumb });
                 }
             }
             renderPages();
@@ -132,11 +171,13 @@
                 const card = document.createElement('div');
                 card.className = 'page-card bg-white p-4 rounded-2xl shadow-sm border border-slate-200 relative';
                 card.dataset.id = page.id;
-                
+
+                const thumbHTML = page.thumbnail ? `<img src="${page.thumbnail}" alt="thumb" class="w-full h-full object-contain transition-transform duration-300" style="transform: rotate(${page.rotation}deg)">` 
+                                                  : `<div class="w-full h-full flex items-center justify-center text-3xl">${page.type === 'pdf' ? '📄' : '🖼️'}</div>`;
                 card.innerHTML = `
                     <div class="text-center font-bold text-[10px] text-slate-400 mb-2 uppercase tracking-tighter">صفحة ${index + 1}</div>
-                    <div class="w-full h-32 bg-slate-50 rounded-xl flex items-center justify-center overflow-hidden mb-3 border border-slate-100">
-                        <span class="text-3xl transition-transform duration-300" style="transform: rotate(${page.rotation}deg)">${page.type === 'pdf' ? '📄' : '🖼️'}</span>
+                    <div onclick="openPreview(${index})" class="w-full h-32 bg-slate-50 rounded-xl flex items-center justify-center overflow-hidden mb-3 border border-slate-100 cursor-pointer">
+                        ${thumbHTML}
                     </div>
                     <div class="flex gap-1">
                         <button onclick="rotatePage('${page.id}')" class="bg-blue-50 text-blue-600 p-2 rounded-lg hover:bg-blue-100 flex-1 text-[10px] font-bold">🔄 تدوير</button>
@@ -167,7 +208,17 @@
         }
 
         function deletePage(id) {
+            const index = loadedPages.findIndex(p => p.id === id);
             loadedPages = loadedPages.filter(p => p.id !== id);
+            // If we were previewing this page, advance preview index
+            if (typeof currentPreviewIndex !== 'undefined') {
+                if (loadedPages.length === 0) {
+                    closePreview();
+                } else {
+                    currentPreviewIndex = Math.min(currentPreviewIndex, loadedPages.length - 1);
+                    if (document.getElementById('previewModal').classList.contains('hidden') === false) showPreview(currentPreviewIndex);
+                }
+            }
             if (loadedPages.length === 0) {
                 document.getElementById('editorArea').classList.add('hidden');
                 document.getElementById('saveBtn').classList.add('hidden');
@@ -175,8 +226,157 @@
             renderPages();
         }
 
+        // ----- Thumbnail & Preview helpers -----
+        async function loadSampleDemo() {
+            // Create a simple 2-page PDF for demo using pdf-lib
+            const { PDFDocument, StandardFonts } = PDFLib;
+            const pdfDoc = await PDFDocument.create();
+            const font = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+            const page1 = pdfDoc.addPage([595, 842]); // A4
+            page1.drawText('PDF Tools — Demo Page 1', { x: 40, y: 780, size: 24, font });
+            page1.drawText('هذا ملف توضيحي تم إنشاؤه تلقائياً لعرض المزايا (صفحة 1).', { x: 40, y: 740, size: 12, font });
+
+            const page2 = pdfDoc.addPage([595, 842]);
+            page2.drawText('PDF Tools — Demo Page 2', { x: 40, y: 780, size: 24, font });
+            page2.drawText('يمكن تدوير، حذف، وترتيب الصفحات ثم حفظ ملف عالي الجودة.', { x: 40, y: 740, size: 12, font });
+
+            const bytes = await pdfDoc.save();
+            // Create a File-like object and pass to loadFiles
+            try {
+                const file = new File([bytes], 'sample-demo.pdf', { type: 'application/pdf' });
+                await loadFiles([file], 'pdf');
+            } catch (e) {
+                // Fallback for environments without File constructor
+                const blob = new Blob([bytes], { type: 'application/pdf' });
+                await loadFiles([blob], 'pdf');
+            }
+        }
+
+        async function renderPdfPageToThumbnail(pdfJsDoc, pageNumber, maxW = 800, maxH = 600) {
+            try {
+                const page = await pdfJsDoc.getPage(pageNumber);
+                const viewport = page.getViewport({ scale: 1, rotation: 0 });
+                const scale = Math.min(maxW / viewport.width, maxH / viewport.height, 1);
+                const scaledViewport = page.getViewport({ scale, rotation: 0 });
+                const canvas = document.createElement('canvas');
+                const ctx = canvas.getContext('2d');
+                const ratio = window.devicePixelRatio || 1;
+                canvas.width = Math.floor(scaledViewport.width * ratio);
+                canvas.height = Math.floor(scaledViewport.height * ratio);
+                canvas.style.width = `${Math.floor(scaledViewport.width)}px`;
+                canvas.style.height = `${Math.floor(scaledViewport.height)}px`;
+                ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+                await page.render({ canvasContext: ctx, viewport: scaledViewport }).promise;
+                return canvas.toDataURL('image/png');
+            } catch (e) {
+                console.warn('Thumbnail render failed', e);
+                return null;
+            }
+        }
+
+        async function renderImageToThumbnail(blob, maxW = 1200, maxH = 900) {
+            return new Promise((res) => {
+                const img = new Image();
+                img.onload = () => {
+                    const ratio = window.devicePixelRatio || 1;
+                    const scale = Math.min(maxW / img.width, maxH / img.height, 1);
+                    const w = Math.floor(img.width * scale);
+                    const h = Math.floor(img.height * scale);
+                    const canvas = document.createElement('canvas');
+                    canvas.width = Math.floor(w * ratio);
+                    canvas.height = Math.floor(h * ratio);
+                    canvas.style.width = `${w}px`;
+                    canvas.style.height = `${h}px`;
+                    const ctx = canvas.getContext('2d');
+                    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+                    ctx.drawImage(img, 0, 0, w, h);
+                    res(canvas.toDataURL('image/png'));
+                };
+                img.src = URL.createObjectURL(blob);
+            });
+        }
+
+        let currentPreviewIndex = 0;
+        function openPreview(index) {
+            currentPreviewIndex = index;
+            document.getElementById('previewModal').classList.remove('hidden');
+            showPreview(index);
+        }
+        function closePreview() {
+            document.getElementById('previewModal').classList.add('hidden');
+        }
+        document.getElementById('closePreview').addEventListener('click', closePreview);
+        document.getElementById('prevPage').addEventListener('click', () => { if (currentPreviewIndex > 0) { currentPreviewIndex--; showPreview(currentPreviewIndex); } });
+        document.getElementById('nextPage').addEventListener('click', () => { if (currentPreviewIndex < loadedPages.length - 1) { currentPreviewIndex++; showPreview(currentPreviewIndex); } });
+        document.getElementById('rotatePreview').addEventListener('click', () => { rotatePage(loadedPages[currentPreviewIndex].id); showPreview(currentPreviewIndex); });
+        document.getElementById('deletePreview').addEventListener('click', () => { deletePage(loadedPages[currentPreviewIndex].id); });
+
+        async function showPreview(index) {
+            const canvas = document.getElementById('previewCanvas');
+            const ctx = canvas.getContext('2d');
+            const p = loadedPages[index];
+            document.getElementById('previewLabel').innerText = `صفحة ${index + 1}`;
+            // Fit canvas to container
+            const container = canvas.parentElement.getBoundingClientRect();
+            const maxW = container.width - 40;
+            const maxH = container.height - 40;
+            const ratio = window.devicePixelRatio || 1;
+            canvas.width = Math.floor(maxW * ratio);
+            canvas.height = Math.floor(maxH * ratio);
+            canvas.style.width = `${maxW}px`;
+            canvas.style.height = `${maxH}px`;
+            ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+            ctx.clearRect(0, 0, maxW, maxH);
+
+            if (p.type === 'pdf' && p.pdfJs) {
+                const page = await p.pdfJs.getPage(p.pageIndex + 1);
+                const viewport = page.getViewport({ scale: 1, rotation: p.rotation });
+                const scale = Math.min(maxW / viewport.width, maxH / viewport.height, 2);
+                const scaledViewport = page.getViewport({ scale, rotation: p.rotation });
+                canvas.width = Math.floor(scaledViewport.width * ratio);
+                canvas.height = Math.floor(scaledViewport.height * ratio);
+                canvas.style.width = `${Math.floor(scaledViewport.width)}px`;
+                canvas.style.height = `${Math.floor(scaledViewport.height)}px`;
+                ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+                await page.render({ canvasContext: ctx, viewport: scaledViewport }).promise;
+            } else if (p.type === 'img') {
+                const img = new Image();
+                await new Promise((res) => {
+                    img.onload = res;
+                    img.src = p.thumbnail || URL.createObjectURL(new Blob([p.bytes], { type: p.imgType }));
+                });
+                // draw centered
+                const scale = Math.min(maxW / img.width, maxH / img.height, 2);
+                const w = img.width * scale, h = img.height * scale;
+                canvas.width = Math.floor(w * ratio);
+                canvas.height = Math.floor(h * ratio);
+                canvas.style.width = `${Math.floor(w)}px`;
+                canvas.style.height = `${Math.floor(h)}px`;
+                ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+                // handle rotation
+                if (p.rotation % 360 !== 0) {
+                    ctx.save();
+                    ctx.translate(w/2, h/2);
+                    ctx.rotate(p.rotation * Math.PI/180);
+                    ctx.drawImage(img, -w/2, -h/2, w, h);
+                    ctx.restore();
+                } else {
+                    ctx.drawImage(img, 0, 0, w, h);
+                }
+            }
+        }
+
+        // close modal on backdrop click
+        document.getElementById('previewModal').addEventListener('click', (e) => {
+            if (e.target.id === 'previewModal') closePreview();
+        });
+
+        // ----- End helpers -----
+
         async function saveFinalPDF() {
             const { PDFDocument, degrees } = PDFLib;
+            const highQuality = document.getElementById('highQuality') ? document.getElementById('highQuality').checked : true;
             const newPdf = await PDFDocument.create();
             
             for (const p of loadedPages) {
@@ -186,11 +386,16 @@
                     newPdf.addPage(copiedPage);
                 } else {
                     let img;
+                    // Prefer PNG embedding for lossless quality when possible
                     if (p.imgType === "image/png") img = await newPdf.embedPng(p.bytes);
-                    else img = await newPdf.embedJpg(p.bytes);
-                    
-                    const page = newPdf.addPage([img.width, img.height]);
-                    page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
+                    else if (p.imgType === "image/jpeg" || p.imgType === "image/jpg") img = await newPdf.embedJpg(p.bytes);
+                    else img = await newPdf.embedPng(p.bytes);
+                    // Use original pixel dimensions (high quality). Cap to a reasonable max to avoid excessively huge PDFs
+                    const maxDim = 4000;
+                    const width = Math.min(img.width, maxDim);
+                    const height = Math.min(img.height, maxDim);
+                    const page = newPdf.addPage([width, height]);
+                    page.drawImage(img, { x: 0, y: 0, width: width, height: height });
                     if (p.rotation !== 0) page.setRotation(degrees(p.rotation));
                 }
             }
@@ -199,7 +404,7 @@
             const blob = new Blob([pdfBytes], { type: 'application/pdf' });
             const link = document.createElement('a');
             link.href = URL.createObjectURL(blob);
-            link.download = "PDF_Tools_Export.pdf";
+            link.download = `PDF_Tools_Export_${new Date().toISOString().replace(/[:.]/g,'-')}.pdf`;
             link.click();
         }
     </script>
