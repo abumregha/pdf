@@ -21,9 +21,17 @@
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700&display=swap');
         body { font-family: 'Tajawal', sans-serif; background-color: #f4f7fa; }
-        .page-card { cursor: grab; transition: transform 0.2s, box-shadow 0.2s; }
+        .page-card { cursor: grab; transition: transform 300ms cubic-bezier(.2,.9,.2,1), box-shadow 200ms ease, opacity 200ms; will-change: transform, opacity; }
         .page-card:active { cursor: grabbing; transform: scale(0.98); }
         .ghost-class { opacity: 0.4; background: #dbeafe; border: 2px dashed #3b82f6; }
+        /* smoother thumbnail transitions */
+        .thumbnail-handle img { transition: transform 300ms cubic-bezier(.2,.9,.2,1); }
+        /* small flash animation when a card is dropped to indicate movement */
+        @keyframes reorderFlash {
+            0% { transform: scale(1.02); box-shadow: 0 20px 40px rgba(59,130,246,0.12); }
+            100% { transform: none; box-shadow: none; }
+        }
+        .page-card.reorder-flash { animation: reorderFlash 320ms ease forwards; }
     </style>
 </head>
 <body class="min-h-screen">
@@ -33,7 +41,6 @@
         <div class="bg-blue-100 w-20 h-20 rounded-full flex items-center justify-center mx-auto mb-6">
             <span class="text-4xl">🔐</span>
         </div>
-        <h2 class="text-2xl font-bold mb-2 text-slate-800">منطقة خاصة</h2>
         <p class="text-gray-500 mb-8 text-sm">يرجى إدخال رمز الوصول للمتابعة</p>
         
         <input type="password" id="passCode" maxlength="6" 
@@ -115,6 +122,18 @@
                 </div>
               </div>
             </div>
+
+            <!-- Loader / progress overlay -->
+            <div id="loaderOverlay" class="fixed inset-0 bg-black/40 hidden z-60 flex items-center justify-center p-4">
+              <div class="bg-white rounded-xl shadow-xl w-full max-w-lg p-6 text-center">
+                <div id="loaderText" class="font-bold text-slate-700 mb-3">جاري تحميل الملفات...</div>
+                <div class="w-full bg-slate-100 rounded-full h-4 overflow-hidden">
+                  <div id="loaderBar" class="h-4 bg-blue-600 w-0"></div>
+                </div>
+                <div id="loaderPercent" class="text-xs text-slate-500 mt-3">0%</div>
+                <div class="mt-4 text-xs text-slate-400">هذا قد يستغرق بعض الوقت للملفات الكبيرة أو الـ PDFs متعددة الصفحات.</div>
+              </div>
+            </div>
         </div>
     </div>
 
@@ -137,28 +156,50 @@
             document.getElementById('saveBtn').classList.remove('hidden');
 
             const { PDFDocument, degrees } = PDFLib;
+            // First pass: gather tasks and compute total items to process for progress
+            const tasks = [];
+            let total = 0;
 
             for (const file of files) {
                 if (type === 'pdf') {
                     const bytes = await file.arrayBuffer();
-                    const pdf = await PDFDocument.load(bytes);
-                    // Try to load PDF via PDF.js for rendering thumbnails
+                    const pdfDoc = await PDFDocument.load(bytes);
                     let pdfJsDoc = null;
                     if (typeof pdfjsLib !== 'undefined') {
                         try { pdfJsDoc = await pdfjsLib.getDocument({ data: bytes }).promise; } catch (e) { console.warn('PDF.js thumbnail failed', e); }
                     }
-                    const count = pdf.getPageCount();
-                    for (let i = 0; i < count; i++) {
-                        const thumb = pdfJsDoc ? await renderPdfPageToThumbnail(pdfJsDoc, i + 1) : null;
-                        loadedPages.push({ type: 'pdf', srcDoc: pdf, pdfJs: pdfJsDoc, pageIndex: i, rotation: 0, id: Math.random().toString(36).substr(2, 9), thumbnail: thumb });
-                    }
+                    const count = pdfDoc.getPageCount();
+                    tasks.push({ type: 'pdf', pdfDoc, pdfJsDoc, bytes, pages: count });
+                    total += count;
                 } else {
                     const bytes = await file.arrayBuffer();
-                    const blob = new Blob([bytes], { type: file.type });
-                    const thumb = await renderImageToThumbnail(blob);
-                    loadedPages.push({ type: 'img', bytes: bytes, imgType: file.type, rotation: 0, id: Math.random().toString(36).substr(2, 9), thumbnail: thumb });
+                    tasks.push({ type: 'img', bytes, imgType: file.type });
+                    total += 1;
                 }
             }
+
+            // Show loader and process tasks
+            let processed = 0;
+            showLoader(total);
+
+            for (const task of tasks) {
+                if (task.type === 'pdf') {
+                    for (let i = 0; i < task.pages; i++) {
+                        const thumb = task.pdfJsDoc ? await renderPdfPageToThumbnail(task.pdfJsDoc, i + 1) : null;
+                        loadedPages.push({ type: 'pdf', srcDoc: task.pdfDoc, pdfJs: task.pdfJsDoc, pageIndex: i, rotation: 0, id: Math.random().toString(36).substr(2, 9), thumbnail: thumb });
+                        processed++;
+                        updateLoader(processed, total);
+                    }
+                } else {
+                    const blob = new Blob([task.bytes], { type: task.imgType });
+                    const thumb = await renderImageToThumbnail(blob);
+                    loadedPages.push({ type: 'img', bytes: task.bytes, imgType: task.imgType, rotation: 0, id: Math.random().toString(36).substr(2, 9), thumbnail: thumb });
+                    processed++;
+                    updateLoader(processed, total);
+                }
+            }
+
+            hideLoader();
             renderPages();
         }
 
@@ -176,7 +217,7 @@
                                                   : `<div class="w-full h-full flex items-center justify-center text-3xl">${page.type === 'pdf' ? '📄' : '🖼️'}</div>`;
                 card.innerHTML = `
                     <div class="text-center font-bold text-[10px] text-slate-400 mb-2 uppercase tracking-tighter">صفحة ${index + 1}</div>
-                    <div onclick="openPreview(${index})" class="w-full h-32 bg-slate-50 rounded-xl flex items-center justify-center overflow-hidden mb-3 border border-slate-100 cursor-pointer">
+                    <div onclick="openPreview(${index})" class="thumbnail-handle w-full h-32 bg-slate-50 rounded-xl flex items-center justify-center overflow-hidden mb-3 border border-slate-100 cursor-move">
                         ${thumbHTML}
                     </div>
                     <div class="flex gap-1">
@@ -189,13 +230,30 @@
 
             // تفعيل السحب والإفلات مع حماية من الأخطاء
             if (typeof Sortable !== 'undefined') {
-                new Sortable(grid, {
-                    animation: 200,
+                // ensure a single Sortable instance for the pages grid
+                if (window.pagesSortable && typeof window.pagesSortable.destroy === 'function') {
+                    try { window.pagesSortable.destroy(); } catch (e) { console.warn('destroy sortable failed', e); }
+                }
+                window.pagesSortable = new Sortable(grid, {
+                    animation: 300,
+                    easing: 'cubic-bezier(.2,.9,.2,1)',
                     ghostClass: 'ghost-class',
+                    handle: '.thumbnail-handle', // drag by the thumbnail area
+                    draggable: '.page-card',
+                    filter: 'button, input, a',
+                    preventOnFilter: false,
                     onEnd: (evt) => {
                         const movedItem = loadedPages.splice(evt.oldIndex, 1)[0];
                         loadedPages.splice(evt.newIndex, 0, movedItem);
                         renderPages();
+                        // after rendering, briefly flash the moved card for UX feedback
+                        setTimeout(() => {
+                            const el = document.querySelector(`.page-card[data-id="${movedItem.id}"]`);
+                            if (el) {
+                                el.classList.add('reorder-flash');
+                                setTimeout(() => el.classList.remove('reorder-flash'), 350);
+                            }
+                        }, 30);
                     }
                 });
             }
@@ -371,6 +429,29 @@
         document.getElementById('previewModal').addEventListener('click', (e) => {
             if (e.target.id === 'previewModal') closePreview();
         });
+
+        // Loader control functions
+        function showLoader(total) {
+            const overlay = document.getElementById('loaderOverlay');
+            const bar = document.getElementById('loaderBar');
+            const percent = document.getElementById('loaderPercent');
+            const text = document.getElementById('loaderText');
+            overlay.classList.remove('hidden');
+            bar.style.width = '0%';
+            percent.innerText = `0%`;
+            text.innerText = `جاري معالجة ${total} عناصر...`;
+        }
+        function updateLoader(done, total) {
+            const bar = document.getElementById('loaderBar');
+            const percent = document.getElementById('loaderPercent');
+            const p = Math.round((done / total) * 100);
+            bar.style.width = p + '%';
+            percent.innerText = `${p}%`;
+        }
+        function hideLoader() {
+            const overlay = document.getElementById('loaderOverlay');
+            overlay.classList.add('hidden');
+        }
 
         // ----- End helpers -----
 
