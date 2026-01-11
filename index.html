@@ -119,6 +119,7 @@
                     <button id="nextPage" class="bg-slate-100 p-2 rounded-md">➡️</button>
                     <button id="rotatePreview" class="bg-blue-600 text-white px-3 py-2 rounded-md">🔄 تدوير</button>
                     <button id="deletePreview" class="bg-red-50 text-red-600 px-3 py-2 rounded-md">🗑️ حذف</button>
+                    <button id="downloadPreviewImg" class="bg-slate-100 p-2 rounded-md">⬇️ حفظ كصورة</button>
                     <button id="addFilesPreview" class="bg-green-50 text-green-700 px-3 py-2 rounded-md">➕ إضافة ملفات</button>
                   </div>
                 </div>
@@ -136,7 +137,12 @@
                   <div id="loaderBar" class="h-4 bg-blue-600 w-0"></div>
                 </div>
                 <div id="loaderPercent" class="text-xs text-slate-500 mt-3">0%</div>
+                <div id="loaderErrors" class="mt-3 text-xs text-red-600 text-left max-h-36 overflow-auto hidden"></div>
                 <div class="mt-4 text-xs text-slate-400">هذا قد يستغرق بعض الوقت للملفات الكبيرة أو الـ PDFs متعددة الصفحات.</div>
+                <div class="mt-4 flex gap-2 justify-center">
+                  <button id="cancelLoad" class="bg-red-50 text-red-700 px-3 py-2 rounded-md">إلغاء</button>
+                  <button id="retryFailed" class="bg-yellow-50 text-yellow-800 px-3 py-2 rounded-md hidden">إعادة المحاولة للملفات الفاشلة</button>
+                </div>
               </div>
             </div>
         </div>
@@ -145,6 +151,7 @@
     <script>
         const SECRET = "061986";
         let loadedPages = [];
+        let currentLoader = null; // { aborted: bool, failed: [] }
 
         function checkAuth() {
             if (document.getElementById('passCode').value === SECRET) {
@@ -159,28 +166,43 @@
             if (!files || files.length === 0) return;
             document.getElementById('editorArea').classList.remove('hidden');
             document.getElementById('saveBtn').classList.remove('hidden');
+            // initialize loader state for this operation
+            currentLoader = { aborted: false, failed: [] };
+
 
             const { PDFDocument, degrees } = PDFLib;
             // Aggregate tasks with auto-detection when type is not provided
             const tasks = [];
             let total = 0;
 
+            // Attach original files to tasks (for retry/error reporting)
             for (const file of files) {
                 const fileType = (file && file.type) ? file.type.toLowerCase() : '';
                 if ((type && type === 'pdf') || fileType === 'application/pdf' || file.name?.toLowerCase().endsWith('.pdf')) {
-                    const bytes = await file.arrayBuffer();
-                    const pdfDoc = await PDFDocument.load(bytes);
-                    let pdfJsDoc = null;
-                    if (typeof pdfjsLib !== 'undefined') {
-                        try { pdfJsDoc = await pdfjsLib.getDocument({ data: bytes }).promise; } catch (e) { console.warn('PDF.js thumbnail failed', e); }
+                    try {
+                        const bytes = await file.arrayBuffer();
+                        const pdfDoc = await PDFDocument.load(bytes);
+                        let pdfJsDoc = null;
+                        if (typeof pdfjsLib !== 'undefined') {
+                            try { pdfJsDoc = await pdfjsLib.getDocument({ data: bytes }).promise; } catch (e) { console.warn('PDF.js thumbnail failed', e); }
+                        }
+                        const count = pdfDoc.getPageCount();
+                        tasks.push({ kind: 'pdf', pdfDoc, pdfJsDoc, bytes, pages: count, originalFile: file });
+                        total += count;
+                    } catch (e) {
+                        // file-level failure
+                        currentLoader.failed.push({ file, name: file.name, message: e.message });
+                        updateLoaderErrors();
                     }
-                    const count = pdfDoc.getPageCount();
-                    tasks.push({ kind: 'pdf', pdfDoc, pdfJsDoc, bytes, pages: count });
-                    total += count;
                 } else {
-                    const bytes = await file.arrayBuffer();
-                    tasks.push({ kind: 'img', bytes, imgType: file.type });
-                    total += 1;
+                    try {
+                        const bytes = await file.arrayBuffer();
+                        tasks.push({ kind: 'img', bytes, imgType: file.type, originalFile: file });
+                        total += 1;
+                    } catch (e) {
+                        currentLoader.failed.push({ file, name: file.name, message: e.message });
+                        updateLoaderErrors();
+                    }
                 }
             }
 
@@ -188,24 +210,48 @@
             let processed = 0;
             showLoader(total);
 
-            for (const task of tasks) {
+            outer: for (const task of tasks) {
+                if (currentLoader.aborted) break;
                 if (task.kind === 'pdf') {
                     for (let i = 0; i < task.pages; i++) {
-                        const thumb = task.pdfJsDoc ? await renderPdfPageToThumbnail(task.pdfJsDoc, i + 1) : null;
-                        loadedPages.push({ type: 'pdf', srcDoc: task.pdfDoc, pdfJs: task.pdfJsDoc, pageIndex: i, rotation: 0, id: Math.random().toString(36).substr(2, 9), thumbnail: thumb });
+                        if (currentLoader.aborted) break outer;
+                        try {
+                            const thumb = task.pdfJsDoc ? await renderPdfPageToThumbnail(task.pdfJsDoc, i + 1) : null;
+                            loadedPages.push({ type: 'pdf', srcDoc: task.pdfDoc, pdfJs: task.pdfJsDoc, pageIndex: i, rotation: 0, id: Math.random().toString(36).substr(2, 9), thumbnail: thumb });
+                        } catch (e) {
+                            currentLoader.failed.push({ file: task.originalFile, name: task.originalFile?.name || `PDF page ${i+1}`, message: e.message });
+                            updateLoaderErrors();
+                        }
                         processed++;
                         updateLoader(processed, total);
                     }
                 } else {
-                    const blob = new Blob([task.bytes], { type: task.imgType });
-                    const thumb = await renderImageToThumbnail(blob);
-                    loadedPages.push({ type: 'img', bytes: task.bytes, imgType: task.imgType, rotation: 0, id: Math.random().toString(36).substr(2, 9), thumbnail: thumb });
+                    if (currentLoader.aborted) break;
+                    try {
+                        const blob = new Blob([task.bytes], { type: task.imgType });
+                        const thumb = await renderImageToThumbnail(blob);
+                        loadedPages.push({ type: 'img', bytes: task.bytes, imgType: task.imgType, rotation: 0, id: Math.random().toString(36).substr(2, 9), thumbnail: thumb });
+                    } catch (e) {
+                        currentLoader.failed.push({ file: task.originalFile, name: task.originalFile?.name || 'image', message: e.message });
+                        updateLoaderErrors();
+                    }
                     processed++;
                     updateLoader(processed, total);
                 }
             }
 
-            hideLoader();
+            // Finalize loader state
+            if (currentLoader.aborted) {
+                document.getElementById('loaderText').innerText = 'تم إيقاف المعالجة.';
+                setTimeout(() => hideLoader(), 900);
+            } else if (currentLoader.failed.length > 0) {
+                document.getElementById('loaderText').innerText = `انتهت المعالجة — فشلت ${currentLoader.failed.length} ملف(ملفات)`;
+                document.getElementById('retryFailed').classList.remove('hidden');
+                updateLoaderErrors();
+            } else {
+                hideLoader();
+            }
+
             // If preview modal is open, keep it open and update to include new pages
             renderPages();
             if (document.getElementById('previewModal') && !document.getElementById('previewModal').classList.contains('hidden')) {
@@ -229,8 +275,9 @@
                                                   : `<div class="w-full h-full flex items-center justify-center text-3xl">${page.type === 'pdf' ? '📄' : '🖼️'}</div>`;
                 card.innerHTML = `
                     <div class="text-center font-bold text-[10px] text-slate-400 mb-2 uppercase tracking-tighter">صفحة ${index + 1}</div>
-                    <div ondblclick="openPreview(${index})" class="thumbnail-handle w-full h-32 bg-slate-50 rounded-xl flex items-center justify-center overflow-hidden mb-3 border border-slate-100 cursor-move" title="انقر مزدوجًا لفتح المعاينة">
+                    <div ondblclick="openPreview(${index})" class="thumbnail-handle relative w-full h-32 bg-slate-50 rounded-xl flex items-center justify-center overflow-hidden mb-3 border border-slate-100 cursor-move" title="انقر مزدوجًا لفتح المعاينة">
                         ${thumbHTML}
+                        <button onclick="openPreviewById('${page.id}');" class="absolute top-2 left-2 bg-white/90 text-xs px-2 py-1 rounded-md shadow-sm hover:bg-white" title="معاينة">🔍 معاينة</button>
                     </div>
                     <div class="flex gap-1">
                         <button onclick="rotatePage('${page.id}')" class="bg-blue-50 text-blue-600 p-2 rounded-lg hover:bg-blue-100 flex-1 text-[10px] font-bold">🔄 تدوير</button>
@@ -371,9 +418,78 @@
         document.getElementById('deletePreview').addEventListener('click', () => { deletePage(loadedPages[currentPreviewIndex].id); });
         // Wire preview add files button to global input
         document.getElementById('addFilesPreview').addEventListener('click', () => { document.getElementById('addFilesInput').click(); });
+        // Add download-as-image handler
+        const downloadBtn = document.getElementById('downloadPreviewImg');
+        if (downloadBtn) downloadBtn.addEventListener('click', () => { downloadPreviewAsImage(currentPreviewIndex); });
         // Also allow the header add button to trigger the input (in case script loads before markup)
         const addFilesBtn = document.getElementById('addFilesBtn');
         if (addFilesBtn) addFilesBtn.addEventListener('click', () => document.getElementById('addFilesInput').click());
+
+        function downloadPreviewAsImage(index) {
+            const canvas = document.getElementById('previewCanvas');
+            if (!canvas) return;
+            // Use toBlob for better memory behavior
+            canvas.toBlob((blob) => {
+                if (!blob) return;
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = `page-${index+1}.png`;
+                a.click();
+            }, 'image/png');
+        }
+
+        // Cancel and retry for loader
+        document.getElementById('cancelLoad').addEventListener('click', () => {
+            if (currentLoader) {
+                currentLoader.aborted = true;
+                document.getElementById('loaderText').innerText = 'جاري الإلغاء...';
+            }
+        });
+        document.getElementById('retryFailed').addEventListener('click', () => {
+            if (currentLoader && currentLoader.failed && currentLoader.failed.length) {
+                const files = currentLoader.failed.map(f => f.file).filter(Boolean);
+                currentLoader.failed = [];
+                document.getElementById('retryFailed').classList.add('hidden');
+                loadFiles(files);
+            }
+        });
+
+        function updateLoaderErrors() {
+            const errorsDiv = document.getElementById('loaderErrors');
+            if (!currentLoader || !currentLoader.failed || currentLoader.failed.length === 0) {
+                errorsDiv.classList.add('hidden');
+                errorsDiv.innerHTML = '';
+                document.getElementById('retryFailed').classList.add('hidden');
+                return;
+            }
+            errorsDiv.classList.remove('hidden');
+            errorsDiv.innerHTML = currentLoader.failed.map((f, i) => `
+                <div class=\"py-1 border-b border-red-100 last:border-b-0 flex items-start justify-between gap-2\">
+                  <div class=\"text-left\"><strong>${escapeHtml(f.name || 'file')}</strong>: ${escapeHtml(f.message || '')}</div>
+                  <div class=\"flex items-center gap-2\"><button onclick=\"retryFailedFile(${i})\" class=\"bg-yellow-50 text-yellow-800 px-2 py-1 rounded-md text-xs\">إعادة</button></div>
+                </div>
+            `).join('');
+            document.getElementById('retryFailed').classList.remove('hidden');
+        }
+
+        function retryFailedFile(idx) {
+            if (!currentLoader || !currentLoader.failed || idx < 0 || idx >= currentLoader.failed.length) return;
+            const entry = currentLoader.failed.splice(idx, 1)[0];
+            updateLoaderErrors();
+            if (entry && entry.file) {
+                // retry the single file
+                loadFiles([entry.file]);
+            }
+        }
+
+        function escapeHtml(s) {
+            return (s||'').toString().replace(/[&<>\"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":"&#39;"})[c]);
+        }
+
+        function openPreviewById(id) {
+            const idx = loadedPages.findIndex(p => p.id === id);
+            if (idx !== -1) openPreview(idx);
+        }
 
         async function showPreview(index) {
             const canvas = document.getElementById('previewCanvas');
