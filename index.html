@@ -69,7 +69,9 @@
                   <button onclick="saveFinalPDF()" id="saveBtn" class="hidden bg-blue-600 text-white px-6 py-3 rounded-xl font-bold hover:bg-blue-700 transition shadow-lg flex items-center gap-2">
                     <span>💾 حفظ وتحميل</span>
                   </button>
-                </div>                <button onclick="loadSampleDemo()" id="demoBtn" class="bg-green-600 text-white px-4 py-3 rounded-xl hover:bg-green-700 transition">عرض توضيحي</button>                <button onclick="location.reload()" class="bg-slate-100 text-slate-600 px-4 py-3 rounded-xl hover:bg-red-50 hover:text-red-600 transition">خروج</button>
+                </div>
+                <button id="addFilesBtn" onclick="document.getElementById('addFilesInput').click()" class="bg-green-600 text-white px-4 py-3 rounded-xl hover:bg-green-700 transition">إضافة ملفات</button>
+                <button onclick="location.reload()" class="bg-slate-100 text-slate-600 px-4 py-3 rounded-xl hover:bg-red-50 hover:text-red-600 transition">خروج</button>
             </div>
         </header>
 
@@ -90,6 +92,8 @@
                     <p class="text-xs text-slate-400 mt-1">JPG, PNG, WEBP</p>
                 </label>
             </div>
+            <!-- Hidden global input to add files while previewing/editor open -->
+            <input type="file" id="addFilesInput" multiple accept=".pdf,image/*" class="hidden" onchange="loadFiles(this.files)">
         </div>
 
         <div id="editorArea" class="hidden">
@@ -115,6 +119,7 @@
                     <button id="nextPage" class="bg-slate-100 p-2 rounded-md">➡️</button>
                     <button id="rotatePreview" class="bg-blue-600 text-white px-3 py-2 rounded-md">🔄 تدوير</button>
                     <button id="deletePreview" class="bg-red-50 text-red-600 px-3 py-2 rounded-md">🗑️ حذف</button>
+                    <button id="addFilesPreview" class="bg-green-50 text-green-700 px-3 py-2 rounded-md">➕ إضافة ملفات</button>
                   </div>
                 </div>
                 <div class="w-full h-[70vh] flex items-center justify-center">
@@ -151,17 +156,18 @@
         }
 
         async function loadFiles(files, type) {
-            if (files.length === 0) return;
+            if (!files || files.length === 0) return;
             document.getElementById('editorArea').classList.remove('hidden');
             document.getElementById('saveBtn').classList.remove('hidden');
 
             const { PDFDocument, degrees } = PDFLib;
-            // First pass: gather tasks and compute total items to process for progress
+            // Aggregate tasks with auto-detection when type is not provided
             const tasks = [];
             let total = 0;
 
             for (const file of files) {
-                if (type === 'pdf') {
+                const fileType = (file && file.type) ? file.type.toLowerCase() : '';
+                if ((type && type === 'pdf') || fileType === 'application/pdf' || file.name?.toLowerCase().endsWith('.pdf')) {
                     const bytes = await file.arrayBuffer();
                     const pdfDoc = await PDFDocument.load(bytes);
                     let pdfJsDoc = null;
@@ -169,11 +175,11 @@
                         try { pdfJsDoc = await pdfjsLib.getDocument({ data: bytes }).promise; } catch (e) { console.warn('PDF.js thumbnail failed', e); }
                     }
                     const count = pdfDoc.getPageCount();
-                    tasks.push({ type: 'pdf', pdfDoc, pdfJsDoc, bytes, pages: count });
+                    tasks.push({ kind: 'pdf', pdfDoc, pdfJsDoc, bytes, pages: count });
                     total += count;
                 } else {
                     const bytes = await file.arrayBuffer();
-                    tasks.push({ type: 'img', bytes, imgType: file.type });
+                    tasks.push({ kind: 'img', bytes, imgType: file.type });
                     total += 1;
                 }
             }
@@ -183,7 +189,7 @@
             showLoader(total);
 
             for (const task of tasks) {
-                if (task.type === 'pdf') {
+                if (task.kind === 'pdf') {
                     for (let i = 0; i < task.pages; i++) {
                         const thumb = task.pdfJsDoc ? await renderPdfPageToThumbnail(task.pdfJsDoc, i + 1) : null;
                         loadedPages.push({ type: 'pdf', srcDoc: task.pdfDoc, pdfJs: task.pdfJsDoc, pageIndex: i, rotation: 0, id: Math.random().toString(36).substr(2, 9), thumbnail: thumb });
@@ -200,7 +206,13 @@
             }
 
             hideLoader();
+            // If preview modal is open, keep it open and update to include new pages
             renderPages();
+            if (document.getElementById('previewModal') && !document.getElementById('previewModal').classList.contains('hidden')) {
+                // show the current preview index (or adjust if out of bounds)
+                currentPreviewIndex = Math.min(currentPreviewIndex, loadedPages.length - 1);
+                showPreview(currentPreviewIndex);
+            }
         }
 
         function renderPages() {
@@ -217,7 +229,7 @@
                                                   : `<div class="w-full h-full flex items-center justify-center text-3xl">${page.type === 'pdf' ? '📄' : '🖼️'}</div>`;
                 card.innerHTML = `
                     <div class="text-center font-bold text-[10px] text-slate-400 mb-2 uppercase tracking-tighter">صفحة ${index + 1}</div>
-                    <div onclick="openPreview(${index})" class="thumbnail-handle w-full h-32 bg-slate-50 rounded-xl flex items-center justify-center overflow-hidden mb-3 border border-slate-100 cursor-move">
+                    <div ondblclick="openPreview(${index})" class="thumbnail-handle w-full h-32 bg-slate-50 rounded-xl flex items-center justify-center overflow-hidden mb-3 border border-slate-100 cursor-move" title="انقر مزدوجًا لفتح المعاينة">
                         ${thumbHTML}
                     </div>
                     <div class="flex gap-1">
@@ -243,17 +255,29 @@
                     filter: 'button, input, a',
                     preventOnFilter: false,
                     onEnd: (evt) => {
-                        const movedItem = loadedPages.splice(evt.oldIndex, 1)[0];
-                        loadedPages.splice(evt.newIndex, 0, movedItem);
-                        renderPages();
-                        // after rendering, briefly flash the moved card for UX feedback
-                        setTimeout(() => {
-                            const el = document.querySelector(`.page-card[data-id="${movedItem.id}"]`);
-                            if (el) {
-                                el.classList.add('reorder-flash');
-                                setTimeout(() => el.classList.remove('reorder-flash'), 350);
+                        try {
+                            const movedId = evt.item?.dataset?.id;
+                            if (!movedId) {
+                                // fallback to index-based move
+                                const movedItem = loadedPages.splice(evt.oldIndex, 1)[0];
+                                loadedPages.splice(evt.newIndex, 0, movedItem);
+                            } else {
+                                const oldIndex = loadedPages.findIndex(p => p.id === movedId);
+                                if (oldIndex !== -1) {
+                                    const [movedItem] = loadedPages.splice(oldIndex, 1);
+                                    loadedPages.splice(evt.newIndex, 0, movedItem);
+                                }
                             }
-                        }, 30);
+                            renderPages();
+                            // after rendering, briefly flash the moved card for UX feedback
+                            setTimeout(() => {
+                                const el = document.querySelector(`.page-card[data-id="${movedId}"]`);
+                                if (el) {
+                                    el.classList.add('reorder-flash');
+                                    setTimeout(() => el.classList.remove('reorder-flash'), 350);
+                                }
+                            }, 30);
+                        } catch (e) { console.warn('reorder failed', e); }
                     }
                 });
             }
@@ -285,31 +309,7 @@
         }
 
         // ----- Thumbnail & Preview helpers -----
-        async function loadSampleDemo() {
-            // Create a simple 2-page PDF for demo using pdf-lib
-            const { PDFDocument, StandardFonts } = PDFLib;
-            const pdfDoc = await PDFDocument.create();
-            const font = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
 
-            const page1 = pdfDoc.addPage([595, 842]); // A4
-            page1.drawText('PDF Tools — Demo Page 1', { x: 40, y: 780, size: 24, font });
-            page1.drawText('هذا ملف توضيحي تم إنشاؤه تلقائياً لعرض المزايا (صفحة 1).', { x: 40, y: 740, size: 12, font });
-
-            const page2 = pdfDoc.addPage([595, 842]);
-            page2.drawText('PDF Tools — Demo Page 2', { x: 40, y: 780, size: 24, font });
-            page2.drawText('يمكن تدوير، حذف، وترتيب الصفحات ثم حفظ ملف عالي الجودة.', { x: 40, y: 740, size: 12, font });
-
-            const bytes = await pdfDoc.save();
-            // Create a File-like object and pass to loadFiles
-            try {
-                const file = new File([bytes], 'sample-demo.pdf', { type: 'application/pdf' });
-                await loadFiles([file], 'pdf');
-            } catch (e) {
-                // Fallback for environments without File constructor
-                const blob = new Blob([bytes], { type: 'application/pdf' });
-                await loadFiles([blob], 'pdf');
-            }
-        }
 
         async function renderPdfPageToThumbnail(pdfJsDoc, pageNumber, maxW = 800, maxH = 600) {
             try {
@@ -369,6 +369,11 @@
         document.getElementById('nextPage').addEventListener('click', () => { if (currentPreviewIndex < loadedPages.length - 1) { currentPreviewIndex++; showPreview(currentPreviewIndex); } });
         document.getElementById('rotatePreview').addEventListener('click', () => { rotatePage(loadedPages[currentPreviewIndex].id); showPreview(currentPreviewIndex); });
         document.getElementById('deletePreview').addEventListener('click', () => { deletePage(loadedPages[currentPreviewIndex].id); });
+        // Wire preview add files button to global input
+        document.getElementById('addFilesPreview').addEventListener('click', () => { document.getElementById('addFilesInput').click(); });
+        // Also allow the header add button to trigger the input (in case script loads before markup)
+        const addFilesBtn = document.getElementById('addFilesBtn');
+        if (addFilesBtn) addFilesBtn.addEventListener('click', () => document.getElementById('addFilesInput').click());
 
         async function showPreview(index) {
             const canvas = document.getElementById('previewCanvas');
